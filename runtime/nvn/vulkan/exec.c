@@ -21,6 +21,7 @@
 #include "../../prof.h"
 #include "../../platform.h"
 #include "shaders.h"
+#include "exec_hot.h"
 #include "vk.h"
 #include "bloom_scale.h"
 #include "vram.h"
@@ -3267,15 +3268,6 @@ typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; }
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 static struct { PipeKey k; Pipe *pp; } pipe_memo;  // (see prog_memo)
 
-// 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
-// stored constants (fragment-shader hashes) and must not change.
-static uint64_t hash_words(uint64_t h, const void *p, size_t n) {
-    const uint8_t *b = p;
-    for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
-    for (; n; n--, b++) { h = (h ^ *b) * 0x100000001B3ull; }
-    return h ^ (h >> 32);
-}
-
 static uint64_t hmix(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = p;
     for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001B3ull; }
@@ -6107,10 +6099,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[2] = w[i].pBufferInfo->offset;
                 v[3] = w[i].pBufferInfo->range;
             }
-            for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
-            }
+            set_hash_add(&h, &h2, v);
         }
         h ^= h >> 32;
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
@@ -7188,25 +7177,6 @@ void vk_pick_report(void) {
     pick.draws = 0;
 }
 
-// Quads / fans / polygons as a 32-bit triangle index list.
-static uint32_t *expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first, uint32_t *out_count) {
-    uint32_t tris = mode == 7 ? count / 4 * 2 : count >= 3 ? count - 2 : 0;
-    uint32_t *out = malloc(tris * 3 * 4 + 4);
-    uint32_t n = 0;
-#define IDX(i) (indices ? (itype == 0 ? ((const uint8_t *)indices)[i] : itype == 1 ? ((const uint16_t *)indices)[i] : ((const uint32_t *)indices)[i]) : first + (i))
-    if (mode == 7) {
-        for (uint32_t q = 0; q + 3 < count; q += 4) {
-            out[n++] = IDX(q); out[n++] = IDX(q + 1); out[n++] = IDX(q + 2);
-            out[n++] = IDX(q); out[n++] = IDX(q + 2); out[n++] = IDX(q + 3);
-        }
-    } else {
-        for (uint32_t i = 1; i + 1 < count; i++) { out[n++] = IDX(0); out[n++] = IDX(i); out[n++] = IDX(i + 1); }
-    }
-#undef IDX
-    *out_count = n;
-    return out;
-}
-
 static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     switch (mode) {
     case 0: *t = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; *cls = 0; return true;
@@ -7978,9 +7948,9 @@ have_pipe:
         first = (uint32_t)r->x[1]; base_inst = (uint32_t)r->x[3]; inst = (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1;
         max_index = first + count;
         if (!native) {
-            uint32_t *e = expand_indices(mode, count, NULL, 0, first, &icount);
-            ib = vk_transient_copy(e, (uint64_t)icount * 4 + 4, 4);
-            free(e);
+            icount = expand_indices_count(mode, count);
+            ib = vk_transient((uint64_t)icount * 4 + 4, 4);
+            expand_indices_into(ib.ptr, mode, count, NULL, 0, first);
         }
     } else {
         uint32_t itype = (uint32_t)r->x[1];
@@ -8000,8 +7970,8 @@ have_pipe:
             } else {
                 if (profd) prof_index_copy++;
                 ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
-                if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != (uint16_t)restart) max_index = s[i]; }
-                else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != restart) max_index = s[i]; }
+                if (isz == 2) max_index = idx_max_u16(src, count, restart, max_index);
+                else max_index = idx_max_u32(src, count, restart, max_index);
             }
         } else if (native) {  // 8-bit indices: widen to 16
             if (profd) prof_index_copy++;
@@ -8013,10 +7983,11 @@ have_pipe:
             icount = count;
         } else {
             if (profd) prof_index_copy++;
-            uint32_t *e = expand_indices(mode, count, src, (int)itype, 0, &icount);
+            icount = expand_indices_count(mode, count);
+            ib = vk_transient((uint64_t)icount * 4 + 4, 4);
+            expand_indices_into(ib.ptr, mode, count, src, (int)itype, 0);
+            uint32_t *e = ib.ptr;
             for (uint32_t i = 0; i < icount; i++) if (e[i] > max_index) max_index = e[i];
-            ib = vk_transient_copy(e, (uint64_t)icount * 4 + 4, 4);
-            free(e);
         }
         if (!scan_src) {
             max_index += 1;
@@ -8053,17 +8024,14 @@ have_pipe:
                 continue;
             }
             if (scan_src) {  // copying after all: the index scan bounds the copy
-                if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != (uint16_t)scan_restart) max_index = q[i]; }
-                else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != scan_restart) max_index = q[i]; }
+                if (scan_isz == 2) max_index = idx_max_u16(scan_src, icount, scan_restart, max_index);
+                else max_index = idx_max_u32(scan_src, icount, scan_restart, max_index);
                 max_index += 1;
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = pipe_memo.k.s.stride[s], need;
-            if (!stride) need = 256;
-            else if (pipe_memo.k.s.divisor[s]) need = ((uint64_t)base_inst + inst + pipe_memo.k.s.divisor[s] - 1) / pipe_memo.k.s.divisor[s] * stride + 256;
-            else need = (uint64_t)max_index * stride + 256;
-            if (v.size && need > v.size) need = v.size;
+            uint64_t stride = pipe_memo.k.s.stride[s];
+            uint64_t need = vertex_need(max_index, inst, base_inst, stride, pipe_memo.k.s.divisor[s], v.size);
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
             else {
                 if (profd) prof_vertex_copy++;

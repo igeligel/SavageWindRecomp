@@ -697,6 +697,20 @@ bench-textures: $(B)/test_textures_format
 .PHONY: test-textures bench-textures
 endif
 
+# The per-draw loops of exec.c (exec_hot.h): pipeline-key and descriptor-set hashes, the index scan / expansion and
+# the vertex-stream range. Pure C, no Vulkan device or game data.
+$(B)/test_vk_exec_hot: tests/test_vk_exec_hot.c runtime/nvn/vulkan/exec_hot.h
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -o $@ $<
+
+test-vk-exec-hot: $(B)/test_vk_exec_hot
+	$(B)/test_vk_exec_hot
+
+bench-vk-exec-hot: $(B)/test_vk_exec_hot
+	$(B)/test_vk_exec_hot --bench
+
+.PHONY: test-vk-exec-hot bench-vk-exec-hot
+
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
 $(B)/two_button_bindings.o: runtime/hle/bindings.c runtime/input_bind.h
 	@mkdir -p $(B)
