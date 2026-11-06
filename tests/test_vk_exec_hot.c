@@ -1,5 +1,5 @@
 // The per-draw hot loops of runtime/nvn/vulkan/exec.c, measured without a Vulkan device or game data. The functions
-// are the ones the renderer calls (exec_hot.h, included by exec.c): the pipeline-key hash, the descriptor-set
+// are the ones the renderer calls (exec_helpers/, included by exec.c): the pipeline-key hash, the descriptor-set
 // content hash, the index scan / expansion and the vertex-stream range. Sizes are the open world's: a few thousand
 // draws a frame, 1-6k indices, two descriptor sets a draw and up to 17 vertex streams.
 //
@@ -11,7 +11,11 @@
 #include <string.h>
 #include <time.h>
 
-#include "../runtime/nvn/vulkan/exec_hot.h"
+#include "../runtime/nvn/vulkan/exec_helpers/hash.h"
+#include "../runtime/nvn/vulkan/exec_helpers/index_expand.h"
+#include "../runtime/nvn/vulkan/exec_helpers/index_scan.h"
+#include "../runtime/nvn/vulkan/exec_helpers/set_hash.h"
+#include "../runtime/nvn/vulkan/exec_helpers/vertex_range.h"
 
 static volatile uint64_t sink;
 

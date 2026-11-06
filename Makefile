@@ -53,9 +53,10 @@ GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/
 RT_SRC   := $(filter-out runtime/control.c runtime/control_game.c,$(wildcard runtime/*.c)) \
             runtime/control.c runtime/control_game.c $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
+EXEC_HELPERS := $(wildcard runtime/nvn/vulkan/exec_helpers/*.h)
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
-            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h) \
-            $(wildcard runtime/services/*.h)
+            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(EXEC_HELPERS) \
+            $(wildcard runtime/ui/*.h) $(wildcard runtime/services/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
 IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
@@ -697,9 +698,9 @@ bench-textures: $(B)/test_textures_format
 .PHONY: test-textures bench-textures
 endif
 
-# The per-draw loops of exec.c (exec_hot.h): pipeline-key and descriptor-set hashes, the index scan / expansion and
-# the vertex-stream range. Pure C, no Vulkan device or game data.
-$(B)/test_vk_exec_hot: tests/test_vk_exec_hot.c runtime/nvn/vulkan/exec_hot.h
+# The per-draw loops of exec.c (exec_helpers/): pipeline-key and descriptor-set hashes, the index scan / expansion
+# and the vertex-stream range. Pure C, no Vulkan device or game data.
+$(B)/test_vk_exec_hot: tests/test_vk_exec_hot.c $(EXEC_HELPERS)
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -o $@ $<
 
