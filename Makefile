@@ -797,6 +797,21 @@ bench-textures: $(B)/test_textures_format
 	$(B)/test_textures_format --bench
 
 .PHONY: test-textures bench-textures
+
+# The per-draw feedback attachment membership (runtime/nvn/vulkan/exec_feedback.c), with synthetic textures.
+$(B)/test_vk_exec_feedback: tests/test_vk_exec_feedback.c runtime/nvn/vulkan/exec_feedback.c runtime/nvn/vulkan/exec_feedback.h $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_vk_exec_feedback.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lm
+
+test-vk-exec-feedback: $(B)/test_vk_exec_feedback
+	$(B)/test_vk_exec_feedback
+
+bench-vk-exec-feedback: $(B)/test_vk_exec_feedback
+	$(B)/test_vk_exec_feedback --bench
+
+.PHONY: test-vk-exec-feedback bench-vk-exec-feedback
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
