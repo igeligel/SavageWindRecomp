@@ -798,6 +798,22 @@ bench-textures: $(B)/test_textures_format
 	$(B)/test_textures_format --bench
 
 .PHONY: test-textures bench-textures
+
+# The per-draw descriptor path (runtime/nvn/vulkan/exec_desc.c): vk_exec_stage_set, cbuf_info, set_finish and the
+# dynamic offsets, with stubs for the device and the game's memory.
+$(B)/test_vk_exec_desc: tests/test_vk_exec_desc.c runtime/nvn/vulkan/exec_desc.c $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_vk_exec_desc.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lpthread -lm
+
+test-vk-exec-desc: $(B)/test_vk_exec_desc
+	$(B)/test_vk_exec_desc
+
+bench-vk-exec-desc: $(B)/test_vk_exec_desc
+	$(B)/test_vk_exec_desc --bench
+
+.PHONY: test-vk-exec-desc bench-vk-exec-desc
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
