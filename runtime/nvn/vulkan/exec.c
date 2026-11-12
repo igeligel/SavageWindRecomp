@@ -22,6 +22,7 @@
 #include "../../platform.h"
 #include "shaders.h"
 #include "vk.h"
+#include "exec_post_hook.h"
 #include "bloom_scale.h"
 #include "vram.h"
 #include "fsr3.h"
@@ -2656,7 +2657,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 
 // ================================================================== programs
 #define MAX_BIND 96
-typedef struct {
+typedef struct Prog {
     ShaderInfo *vi, *fi;
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
     int8_t ui;                  // vertex shader of the game's layouts (freecam_hud_drop): 0 unknown, 1 yes, -1 no
@@ -6422,10 +6423,7 @@ void vk_exec_reset(void) {
 }
 
 // The 3D scene upscaled / sharpened for this draw (scene_post): sampled instead of the scene texture, at its scale.
-static void scene_post(Prog *pr, CmdRec *r);
 static void save_view_png(TexBackend *b, VkImageView src, const char *path);
-static void fg_draw(Prog *pr, CmdRec *r);  // (frame generation, below: the camera, the depth, the HUD-less image)
-static void fg_before_draw(void);
 static bool freecam_hud_drop(Prog *pr, CmdRec *r);
 
 // SAVAGEWIND_ANISO_ALL=<presented frame>: from then on every texture takes Video > Anisotropic filtering's override,
@@ -9633,7 +9631,7 @@ static bool freecam_hud_drop(Prog *pr, CmdRec *r) {
 
 // The grading the settings ask for, as grade.frag's push constants, and the LUT's view (or NULL). false: nothing to do
 // (every setting neutral, or SAVAGEWIND_SCENE_GRADE=0): the pass doesn't run.
-static bool grade_wanted(VkImageView *lut, float pc[16]) {
+bool vk_exec_grade_wanted(VkImageView *lut, float pc[16]) {
     *lut = VK_NULL_HANDLE;
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_SCENE_GRADE") && !atoi(getenv("SAVAGEWIND_SCENE_GRADE"));
@@ -9686,26 +9684,18 @@ static bool dlss_wanted(void);
 
 static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend **taa);
 static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, uint32_t oh);
-static void scene_post(Prog *pr, CmdRec *r) {
+void vk_exec_scene_post_off(void) { scene_up.t = NULL; }
+void vk_exec_scene_post_do(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
     NvnTexture *taa_t = NULL;
     TexBackend *taa = NULL;  // (TAA's output for the scene taa_t: what FSR 1 and CAS start from)
     if (mvec_enabled() && mvec_scene_view(pr, r, &taa_t, &taa)) return;
-    static int fsr_on = -1, cas_on = -1;
-    if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
-    if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
-    bool dlss = dlss_wanted();
-    bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
-    // (once a frame: this runs for every draw, and only the scene's composite uses it)
-    static uint64_t grade_frame = ~0ull;
-    static VkImageView lut;
-    static float gpc[16];
-    static bool grade;
-    if (grade_frame != renderer_present_count()) {
-        grade_frame = renderer_present_count();
-        grade = grade_wanted(&lut, gpc);
-    }
-    bool fsr3 = fsr_on && rt_fsr3() && mvec_enabled();  // (FSR 3: its own sharpening, RCAS, in place of CAS)
+    bool dlss = vk_exec_post_dlss;
+    bool fsr = vk_exec_post_fsr1, cas = vk_exec_post_cas;
+    VkImageView lut = vk_exec_post_lut;
+    const float *gpc = vk_exec_post_gpc;
+    bool grade = vk_exec_post_grade_on;
+    bool fsr3 = vk_exec_post_fsr3;  // (FSR 3: its own sharpening, RCAS, in place of CAS)
     if (!fsr3 && !dlss) rt_jitter_set_phases(8);  // (theirs: set by fsr3_scene, dlss_scene)
     if (!dlss && !fsr && !cas && !taa && !fsr3 && !grade) return;
     NvnTexture *t = scene_composite(pr, r), *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
@@ -9741,7 +9731,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
             TexBackend *g = post_image(32, w, h, b->format);
             VkImageView gi[3] = {src, lut};
             gp_mark(cb, "colour grading%s", lut ? " + LUT" : "");
-            post_pass_pc(cb, lut ? "grade_lut.frag" : "grade.frag", gi, lut ? 2 : 1, g, gpc, sizeof gpc, false);
+            post_pass_pc(cb, lut ? "grade_lut.frag" : "grade.frag", gi, lut ? 2 : 1, g, gpc, sizeof vk_exec_post_gpc, false);
             src = post_view(g);
             out = in = g;
         }
@@ -9894,8 +9884,9 @@ static VkFormat srgb_of(VkFormat f) {
     return f == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : f == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : f;
 }
 
-static void fg_copy_hudless(void) {
+void vk_exec_fg_copy_hudless_do(void) {
     fg.copy_pending = false;
+    vk_exec_post_set_copy_pending(false);
     TexBackend *s = fg.out_rt ? vk_tex(fg.out_rt, true) : NULL;
     if (!s || !s->image || s->aspect != VK_IMAGE_ASPECT_COLOR_BIT || s->layers != 1 || s->samples != 1) return;
     // (as the presented image has it: BOTW draws the HUD into a linear 10-bit image, then copies that sRGB-encoded into
@@ -9913,12 +9904,7 @@ static void fg_copy_hudless(void) {
     fg.hudless_ok = true;
 }
 
-static void fg_before_draw(void) {
-    if (fg.copy_pending) fg_copy_hudless();
-}
-
-static void fg_draw(Prog *pr, CmdRec *r) {
-    if (!g_fg_want && !dlss_wanted()) return;  // (DLSS's motion vectors are made from the same camera: dlss_scene)
+void vk_exec_fg_draw_do(Prog *pr, CmdRec *r) {
     if (st.rt.depth && vk_texture_scale_group(st.rt.depth) == RS_SCENE) {
         Range u = st.ubuf[0][0];
         const float *f = (const float *)(uintptr_t)u.addr;
@@ -9944,6 +9930,7 @@ static void fg_draw(Prog *pr, CmdRec *r) {
         fg.out_rt = st.rt.color[0];
         fg.scene = t;
         fg.copy_pending = true;  // (after this draw: fg_before_draw)
+        vk_exec_post_set_copy_pending(true);
     }
 }
 
@@ -10067,7 +10054,7 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
     TexBackend *ob = fg.out_rt ? vk_tex(fg.out_rt, true) : NULL;
     bool same = ob && ob->width == b->width && ob->height == b->height && fg.present_format == unorm_of(b->format);
     fg.present_format = unorm_of(b->format);
-    if (fg.copy_pending) fg_copy_hudless();  // (nothing drawn after the composite)
+    if (fg.copy_pending) vk_exec_fg_copy_hudless_do();  // (nothing drawn after the composite)
     uint64_t now = SDL_GetTicksNS();
     float frame_ms = fg.last_ns ? (float)((now - fg.last_ns) / 1e6) : 16.7f;
     fg.last_ns = now;
@@ -10172,6 +10159,7 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
     fg.have_prev = ok;
     fg.ncand = 0;
     fg.hudless_ok = fg.copy_pending = false;
+    vk_exec_post_set_copy_pending(false);
     fg.out_rt = fg.scene = NULL;
     return out;
 }
@@ -10788,6 +10776,7 @@ void vk_list_stats_frame(void) {  // (device.c, each present)
 }
 
 static void exec_list(uint64_t handle, int depth) {
+    if (!depth) vk_exec_post_update();  // (the frame's post/frame-generation flags, once per list)
     uint64_t p = handle;
     if (lst_on < 0) lst_on = getenv("SAVAGEWIND_VK_LIST_STATS") != NULL;
     if (lst_on) lst_begin(depth);

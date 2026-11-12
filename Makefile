@@ -797,6 +797,21 @@ bench-textures: $(B)/test_textures_format
 	$(B)/test_textures_format --bench
 
 .PHONY: test-textures bench-textures
+
+# The per-draw post/frame-generation gate (runtime/nvn/vulkan/exec_post_hook.c), with stubs for the feature checks.
+$(B)/test_vk_exec_post: tests/test_vk_exec_post.c runtime/nvn/vulkan/exec_post_hook.c runtime/nvn/vulkan/exec_post_hook.h $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_vk_exec_post.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lm
+
+test-vk-exec-post: $(B)/test_vk_exec_post
+	$(B)/test_vk_exec_post
+
+bench-vk-exec-post: $(B)/test_vk_exec_post
+	$(B)/test_vk_exec_post --bench
+
+.PHONY: test-vk-exec-post bench-vk-exec-post
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
