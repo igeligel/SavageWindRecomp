@@ -8520,8 +8520,8 @@ static void draw_(CmdRec *r, bool indexed) {
                                       ? vk_hash_bytes((const void *)(uintptr_t)t->addr, (uint64_t)t->width * t->height * 4) : 0;
                     o += snprintf(buf + o, sizeof buf - o, " | %c%d #%llu %ux%u@%llx%s img %d up %d dyn %d mem %08llx data %08llx",
                                   sg ? 't' : 'v', i, (unsigned long long)t->debug_id, t->width, t->height, (unsigned long long)t->addr,
-                                  t->finalized ? " FIN" : "", b != NULL, b ? b->uploaded : 0, b ? b->dynamic : 0,
-                                  (unsigned long long)(mh & 0xFFFFFFFF), (unsigned long long)(b ? b->data_hash & 0xFFFFFFFF : 0));
+                                  t->finalized ? " FIN" : "", b != NULL, b ? b->watch.uploaded : 0, b ? b->watch.dynamic : 0,
+                                  (unsigned long long)(mh & 0xFFFFFFFF), (unsigned long long)(b ? b->watch.data_hash & 0xFFFFFFFF : 0));
                 }
             }
             LOG("[into] frame %llu layer %u vp %.0f %.0f %.0f %.0f sc %d %d %d %d fs %llx%s\n", (unsigned long long)renderer_present_count(),
