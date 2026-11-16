@@ -798,6 +798,7 @@ bench-vk-exec-feedback: $(B)/test_vk_exec_feedback
 	$(B)/test_vk_exec_feedback --bench
 
 .PHONY: test-vk-exec-feedback bench-vk-exec-feedback
+
 # The per-draw post/frame-generation gate (runtime/nvn/vulkan/exec_post_hook.c), with stubs for the feature checks.
 $(B)/test_vk_exec_post: tests/test_vk_exec_post.c runtime/nvn/vulkan/exec_post_hook.c runtime/nvn/vulkan/exec_post_hook.h $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -812,6 +813,21 @@ bench-vk-exec-post: $(B)/test_vk_exec_post
 	$(B)/test_vk_exec_post --bench
 
 .PHONY: test-vk-exec-post bench-vk-exec-post
+# The per-draw descriptor path (runtime/nvn/vulkan/exec_desc.c): vk_exec_stage_set, cbuf_info, set_finish and the
+# dynamic offsets, with stubs for the device and the game's memory.
+$(B)/test_vk_exec_desc: tests/test_vk_exec_desc.c runtime/nvn/vulkan/exec_desc.c $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_vk_exec_desc.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lpthread -lm
+
+test-vk-exec-desc: $(B)/test_vk_exec_desc
+	$(B)/test_vk_exec_desc
+
+bench-vk-exec-desc: $(B)/test_vk_exec_desc
+	$(B)/test_vk_exec_desc --bench
+
+.PHONY: test-vk-exec-desc bench-vk-exec-desc
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.

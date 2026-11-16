@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../shaders.h"
 #include "../vk.h"
 
 // The render targets bound by the command list (begin_pass reads them).
@@ -75,6 +76,41 @@ typedef struct {
 
 extern ExecState st;
 extern ExecDrawCache dc;
+
+// The descriptor bindings of one program stage (exec_desc.c, stage_set).
+#define MAX_BIND 96
+
+// Transient copies shared by identical consecutive draws (exec.c, copy_dedupe).
+enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_GMEM, DEDUPE_SLOTS };
+
+// Texture scales the draw path and the descriptor sets share (exec.c).
+extern float tex_sc[2][64][2];
+extern uint32_t tex_wh[2][64][2];
+
+// Descriptor-set stats (exec.c stats line).
+extern uint64_t stat_sets, stat_sets_reused;
+
+// ---- entry points of modules split out of exec.c
+VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDescriptorSetLayout layout, uint32_t set,
+                                  int stage, ShaderInfo *si, const float *rscale_row0, const float tint[8], uint32_t gx,
+                                  uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, int *ndyn);
+VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size);
+
+// ---- helpers exec_desc.c calls that still live in exec.c
+VkSpan copy_dedupe_in(int slot, const void *data, uint64_t size, uint64_t alloc, uint64_t align);
+VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align);
+VkSpan guest_copy(uint64_t addr, uint64_t size);
+bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
+void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]);
+VkDescriptorBufferInfo gmem_info(void);
+VkDescriptorBufferInfo gmem_info_hi(void);
+VkDescriptorBufferInfo gsnap_info(int stage);
+bool vk_exec_cbuf_patch(int stage, int k, uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
+#ifdef _WIN32
+void vk_exec_gmem_stage_prepare(int stage, ShaderInfo *si);
+#else
+static inline void vk_exec_gmem_stage_prepare(int stage, ShaderInfo *si) { (void)stage; (void)si; }
+#endif
 
 // Generations that invalidate cached command-buffer state.
 extern uint64_t dyn_epoch;
