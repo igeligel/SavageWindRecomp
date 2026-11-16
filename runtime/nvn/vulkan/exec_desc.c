@@ -6,6 +6,7 @@
 
 #include "../../rt.h"
 #include "exec/internal.h"
+#include "exec_helpers/set_hash.h"
 #include "mvec.h"
 #include "record.h"
 
@@ -203,10 +204,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[2] = w[i].pBufferInfo->offset;
                 v[3] = w[i].pBufferInfo->range;
             }
-            for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
-            }
+            set_hash_add(&h, &h2, v);
         }
         h ^= h >> 32;
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);

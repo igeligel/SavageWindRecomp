@@ -53,8 +53,9 @@ GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/
 RT_SRC   := $(filter-out runtime/control.c runtime/control_game.c,$(wildcard runtime/*.c)) \
             runtime/control.c runtime/control_game.c $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
+EXEC_HELPERS := $(wildcard runtime/nvn/vulkan/exec_helpers/*.h)
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
-            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) \
+            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(EXEC_HELPERS) \
             $(wildcard runtime/nvn/vulkan/exec/*.h) $(wildcard runtime/ui/*.h) \
             $(wildcard runtime/services/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
@@ -829,6 +830,20 @@ bench-vk-exec-desc: $(B)/test_vk_exec_desc
 
 .PHONY: test-vk-exec-desc bench-vk-exec-desc
 endif
+
+# The per-draw loops of exec.c (exec_helpers/): pipeline-key and descriptor-set hashes, the index scan / expansion
+# and the vertex-stream range. Pure C, no Vulkan device or game data.
+$(B)/test_vk_exec_hot: tests/test_vk_exec_hot.c $(EXEC_HELPERS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -o $@ $<
+
+test-vk-exec-hot: $(B)/test_vk_exec_hot
+	$(B)/test_vk_exec_hot
+
+bench-vk-exec-hot: $(B)/test_vk_exec_hot
+	$(B)/test_vk_exec_hot --bench
+
+.PHONY: test-vk-exec-hot bench-vk-exec-hot
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
 $(B)/two_button_bindings.o: runtime/hle/bindings.c runtime/input_bind.h
