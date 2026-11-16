@@ -18,6 +18,7 @@
 
 #include "../nvn.h"
 #include "../maxwell/shader.h"
+#include "tex_watch.h"
 
 void vk_device_fault_report(void);
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); \
@@ -105,7 +106,7 @@ typedef struct TexBackend {
     VkImageViewType base_type;
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
-    bool gpu_owned, uploaded, dynamic;
+    bool gpu_owned;
     bool slices_renderable;  // 3D image made 2D-array compatible: its slices are render targets
     bool not_attachable;     // made without a color or depth/stencil attachment usage (vk_view: no render view)
     bool cube_ok;            // made cube compatible: cube and cube-array views allowed
@@ -114,7 +115,7 @@ typedef struct TexBackend {
     bool in_feedback_layout; // in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL now (g_vk.feedback_layout: a pass that loops, exec.c)
     VkFormat view_fmt[2];    // (g_vk.lean_usage) the only formats its views may have; nview_fmt 0: any compatible one
     uint8_t nview_fmt;
-    uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    TexWatch watch;  // change detection for a CPU-owned texture (tex_watch.c, upload_texture)
     bool scalable, presented;
     bool native_post;           // shader-identified bloom target: never inherit a scene scale
     uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)

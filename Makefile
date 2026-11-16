@@ -796,7 +796,31 @@ test-textures: $(B)/test_textures_format
 bench-textures: $(B)/test_textures_format
 	$(B)/test_textures_format --bench
 
-.PHONY: test-textures bench-textures
+# The per-use texture change detection (runtime/nvn/vulkan/tex_watch.c), on a workload modeled from the [vk] log
+# lines in issue #589: ~50 textures a frame, static compressed ones, CPU-written video and one-shot menu updates.
+$(B)/test_textures_upload: tests/test_textures_upload.c runtime/nvn/vulkan/tex_watch.c runtime/nvn/vulkan/tex_watch.h $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -Iruntime/nvn/vulkan -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_textures_upload.c runtime/nvn/vulkan/tex_watch.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lm
+
+# The same module with the old "once dynamic, dynamic forever" behaviour, for the before/after table.
+$(B)/test_textures_upload_baseline: tests/test_textures_upload.c runtime/nvn/vulkan/tex_watch.c runtime/nvn/vulkan/tex_watch.h $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -Iruntime/nvn/vulkan -DTEX_WATCH_STABLE_FRAMES=0xffffffffu -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_textures_upload.c runtime/nvn/vulkan/tex_watch.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lm
+
+test-textures-upload: $(B)/test_textures_upload
+	$(B)/test_textures_upload
+
+bench-textures-upload: $(B)/test_textures_upload_baseline $(B)/test_textures_upload
+	@echo "=== before (dynamic stays dynamic) ==="
+	$(B)/test_textures_upload_baseline --bench
+	@echo "=== after (periodic full verification) ==="
+	$(B)/test_textures_upload --bench
+
+.PHONY: test-textures bench-textures test-textures-upload bench-textures-upload
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.

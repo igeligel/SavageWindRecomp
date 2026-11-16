@@ -856,7 +856,6 @@ static void free_backend(TexBackend *b) {
 // SAVAGEWIND_NO_KEEP_IMAGES=1: freed after PARK_FRAMES, as before.
 #define KEEP_MAX_IMAGE (16ull << 20)
 #define KEEP_BUDGET (192ull << 20)
-static uint64_t hash_full(const uint8_t *p, uint64_t n);
 static uint64_t storage_size(const NvnTexture *t);
 
 static bool keep_ok(TexBackend *b, uint64_t *bytes) {
@@ -903,7 +902,7 @@ static void idle_expire(void) {  // (gpu lock held)
         if (!keep_ok(b, &bytes)) { free_backend(b); continue; }
         b->kept = true;
         b->kept_bytes = bytes;
-        b->kept_hash = hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size);
+        b->kept_hash = tex_watch_hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size);
         g_kept_bytes += bytes;
     }
     while (g_kept_bytes > KEEP_BUDGET) {
@@ -1010,7 +1009,7 @@ static void vram_trim(void) {  // (gpu lock held; once a frame from tex_backend)
         vmaGetAllocationInfo(g_vk.vma, b->mem, &ai);
         destroy_image(b);
         b->evicted = true;
-        b->uploaded = false;
+        b->watch.uploaded = false;
         freed += ai.size;
     }
     vt_evicted += k;
@@ -1053,7 +1052,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     b = t->addr ? keyed_find(t) : NULL;
     if (b && b->kept) {  // (idle_expire) its contents, unless the CPU wrote that memory meanwhile
-        bool same = b->guest_size == storage_size(t) && hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size) == b->kept_hash;
+        bool same = b->guest_size == storage_size(t) && tex_watch_hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size) == b->kept_hash;
         static int nlog = -1;
         if (nlog < 0) nlog = getenv("SAVAGEWIND_LOG_KEPT") ? 20 : 0;
         if (nlog > 0) {
@@ -1106,36 +1105,8 @@ void vk_textures_reset(void) {
     LOG("[vk] reboot: %d images released\n", n);
 }
 
-// ================================================================== uploads (same change detection as metal.m)
+// ================================================================== uploads (change detection: tex_watch.c)
 static uint64_t full_hash_budget, full_hash_budget_frame;
-
-// Four independent lanes (one serial multiply chain ran at ~1.5 bytes/cycle; dynamic textures are hashed every
-// frame). Values are only compared within a run.
-static uint64_t hash_full(const uint8_t *p, uint64_t n) {
-    uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = 0xC2B2AE3D27D4EB4Full, h2 = 0x165667B19E3779F9ull, h3 = 0x27D4EB2F165667C5ull;
-    uint64_t i = 0;
-    for (; i + 32 <= n; i += 32) {
-        uint64_t v[4];
-        memcpy(v, p + i, 32);
-        h0 = (h0 ^ v[0]) * 0x100000001B3ull; h0 ^= h0 >> 29;
-        h1 = (h1 ^ v[1]) * 0x100000001B3ull; h1 ^= h1 >> 29;
-        h2 = (h2 ^ v[2]) * 0x100000001B3ull; h2 ^= h2 >> 29;
-        h3 = (h3 ^ v[3]) * 0x100000001B3ull; h3 ^= h3 >> 29;
-    }
-    uint64_t h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull);
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
-    return h ^ (h >> 31);
-}
-
-// 8 bytes at each of up to 2048 places (a byte at each of 4096 was a cache miss per byte: ~50 textures a frame are
-// sampled in the open world).
-static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
-    uint64_t h = 1469598103934665603ull;
-    uint64_t words = n / 8, step = words > 2048 ? words / 2048 : 1;
-    for (uint64_t i = 0; i < words; i += step) { uint64_t w; memcpy(&w, p + i * 8, 8); h = (h ^ w) * 1099511628211ull; h ^= h >> 29; }
-    for (uint64_t i = words * 8; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
-    return h ^ n;
-}
 
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1181,8 +1152,7 @@ static bool storage_readable(NvnTexture *t, uint64_t total) {
 static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
-    if (!written && b->uploaded && b->checked_frame == frame) return;
-    if (!written && b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+    if (!tex_watch_gate(&b->watch, written, frame, (uintptr_t)b)) return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
     uint64_t total = storage_size(t);
@@ -1194,36 +1164,29 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
                 (unsigned long long)total, (unsigned long long)t->addr, (unsigned long long)(uintptr_t)t->pool,
                 (unsigned long long)(t->pool ? t->pool->storage : 0), (unsigned long long)(t->pool ? t->pool->size : 0),
                 (unsigned long long)t->pool_offset);
-        b->checked_frame = frame;
+        b->watch.checked_frame = frame;
         return;
     }
-    b->checked_frame = frame;
     prof_tex_checks++;
     SW_TALLY("tex/checks");
-    if (t->flags & 0x10) b->dynamic = true;
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("SAVAGEWIND_TEX_FULLHASH") ? 1 : 0;
-    bool full = b->dynamic || !b->uploaded || always_full;
-    if (!full && frame - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
-    if (!full) {
-        prof_tex_samples++;
-        SW_TALLY("tex/sampled");
-        uint64_t sh = fnv_sample(mem, total);
-        if (sh == b->sample_hash) return;
+    bool force_full = always_full;
+    if (!b->watch.dynamic && b->watch.uploaded && frame - b->watch.full_frame >= 120 && full_hash_budget >= total) {
+        force_full = true;
+        full_hash_budget -= total;
     }
-    prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
-    if (b->dynamic) SW_TALLY("tex/full hash (dynamic)");
-    else SW_TALLY("tex/full hash");
-    SW_COUNT("tex full hash bytes", total);
-    uint64_t h = hash_full(mem, total);
-    b->full_frame = frame;
-    b->sample_hash = fnv_sample(mem, total);
-    if (b->uploaded && h == b->data_hash) return;
-    if (b->uploaded && h != b->data_hash && !written) b->dynamic = true;
-    b->data_hash = h;
-    b->uploaded = true;
+    TexWatchResult r = tex_watch_check(&b->watch, mem, total, written, (t->flags & 0x10) != 0, force_full, frame);
+    if (r.sampled) { prof_tex_samples++; SW_TALLY("tex/sampled"); }
+    if (r.full) {
+        prof_tex_full++; prof_tex_full_bytes += total; if (r.dynamic) prof_tex_dyn++;
+        if (r.dynamic) SW_TALLY("tex/full hash (dynamic)");
+        else SW_TALLY("tex/full hash");
+        SW_COUNT("tex full hash bytes", total);
+    }
+    if (!r.changed) return;
     perfcount_add(PC_TEX_BYTES, total);
     {   // (debugging) SAVAGEWIND_DUMP_RAW=<w>x<h>x<nvn format hex>: the guest storage of such textures as uploaded
         static const char *e = (const char *)1;
@@ -1641,7 +1604,7 @@ void vk_trace_dump(NvnTexture *t) {
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (!for_render && !b->gpu_owned && vk_trace_tex(t))  // (CPU-owned: guest memory is uploaded when it changed)
-        vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
+        vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->watch.uploaded, b->watch.dynamic);
     if (b->pending_rgba) upload_pending(b);
     if (b->glyph_gen && b->glyph_gen != glyphs_generation()) upload_levels(t, b, 1);  // (button icons: other device)
     // Levels nvnTextureWriteTexels filled go up now, also into an image the GPU draws into: BOTW writes level 0 of its
@@ -1670,7 +1633,7 @@ void vk_texture_reload(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     upload_levels(t, b, ~0u);
 }
-uint64_t vk_hash_bytes(const void *p, uint64_t n) { return hash_full(p, n); }
+uint64_t vk_hash_bytes(const void *p, uint64_t n) { return tex_watch_hash_full(p, n); }
 
 bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
 
