@@ -91,7 +91,7 @@ extern uint32_t tex_wh[2][64][2];
 extern uint64_t stat_sets, stat_sets_reused;
 
 // ---- entry points of modules split out of exec.c
-VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDescriptorSetLayout layout, uint32_t set,
+VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, const uint8_t *idx, int n, VkDescriptorSetLayout layout,
                                   int stage, ShaderInfo *si, const float *rscale_row0, const float tint[8], uint32_t gx,
                                   uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, int *ndyn);
 VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size);

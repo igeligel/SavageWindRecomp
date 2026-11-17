@@ -55,6 +55,7 @@
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_links_now;    // pipelines linked on the render thread within the frame's budget (link_now)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_restart_n, stat_restart_color, stat_restart_view, stat_restart_depth;  // (VK_PROF) pass restarts by cause
 static uint64_t draws_total;  // (every draw since the start, never reset: vk_draw_total)
 uint64_t vk_draw_total(void) { return draws_total; }  // (device.c boot_held: how much the game draws a frame)
 static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
@@ -89,6 +90,7 @@ static int pass_nblock;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
+static _Atomic uint64_t stat_alloc_calls, stat_alloc_sets;  // (VK_PROF) vkAllocateDescriptorSets calls / sets they returned
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
 static NvnTexture *scene_depth;
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
@@ -882,18 +884,20 @@ void renderer_wait_seq(uint64_t seq) {
 }
 
 // A call per set costs the driver a lock, a free-list walk and a handle write (~0.25 ms a frame at ~3000 new sets). Sets
-// are taken from the pool in growing batches of one layout (a few draws' worth: 1, 2, 4, 8, 16) and handed out one by
+// are taken from the pool in growing batches of one layout (a few draws' worth: 4, 8, 16) and handed out one by
 // one; a batch belongs to one submission's pool, so it dies with that pool's reset (the slot's seq changes then).
-#define ASET_CACHE 16
-#define ASET_BATCH 16
+#define ASET_CACHE 128
+#define ASET_BATCH 32
 static VkDescriptorSet vk_alloc_set_one(VkDescriptorSetLayout layout, int count, VkDescriptorSet *out);
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     static struct { VkDescriptorSetLayout layout; Sub *s; uint64_t seq; int pool, n, next; VkDescriptorSet set[ASET_BATCH]; } cache[ASET_CACHE];
     Sub *s = sub();
-    uint32_t h = (uint32_t)(((uintptr_t)layout >> 4) * 2654435761u) >> 28;  // (16 entries)
+    uint32_t h = (uint32_t)(((uintptr_t)layout >> 4) * 2654435761u);
+    h ^= h >> 16;
+    h &= ASET_CACHE - 1;
     __typeof__(cache[0]) *c = &cache[h];
     if (c->layout == layout && c->s == s && c->seq == s->seq && c->pool == s->cur_pool && c->n > 0) return c->set[--c->n];
-    if (c->layout != layout) { c->layout = layout; c->next = 1; }
+    if (c->layout != layout) { c->layout = layout; c->next = 4; }
     else if (c->next < ASET_BATCH) c->next *= 2;
     VkDescriptorSet got[ASET_BATCH];
     int want = c->next;
@@ -930,14 +934,22 @@ static VkDescriptorSet vk_alloc_set_one(VkDescriptorSetLayout layout, int count,
             for (int i = 0; i < count; i++) ls[i] = layout;
             VkDescriptorSetAllocateInfo bai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                .descriptorPool = s->pools[s->cur_pool], .descriptorSetCount = (uint32_t)count, .pSetLayouts = ls};
-            if (vkAllocateDescriptorSets(g_vk.dev, &bai, out) == VK_SUCCESS) return VK_NULL_HANDLE;
+            atomic_fetch_add_explicit(&stat_alloc_calls, 1, memory_order_relaxed);
+            if (vkAllocateDescriptorSets(g_vk.dev, &bai, out) == VK_SUCCESS) {
+                atomic_fetch_add_explicit(&stat_alloc_sets, (uint64_t)count, memory_order_relaxed);
+                return VK_NULL_HANDLE;
+            }
             count = 1;  // (this pool is nearly full: take sets one at a time, as before, until it is)
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                           .descriptorPool = s->pools[s->cur_pool], .descriptorSetCount = 1, .pSetLayouts = &layout};
         VkDescriptorSet set;
+        atomic_fetch_add_explicit(&stat_alloc_calls, 1, memory_order_relaxed);
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, &set);
-        if (r == VK_SUCCESS) return set;
+        if (r == VK_SUCCESS) {
+            atomic_fetch_add_explicit(&stat_alloc_sets, 1, memory_order_relaxed);
+            return set;
+        }
         s->cur_pool++;
     }
 }
@@ -1265,8 +1277,10 @@ const char *renderer_stats(void) {
              (double)stat_upload_bytes / 1048576.0);
     {
         size_t n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared), fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
-                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_feedback_loops,
+        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared), alloc %llu calls/%llu sets, fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
+                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused,
+                 (unsigned long long)atomic_exchange(&stat_alloc_calls, 0), (unsigned long long)atomic_exchange(&stat_alloc_sets, 0),
+                 (unsigned long long)stat_feedback_loops,
                  (unsigned long long)stat_feedback_barriers, (unsigned long long)stat_gw_waits, (unsigned long long)stat_gw_holds);
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
@@ -1313,11 +1327,15 @@ const char *renderer_stats(void) {
                  prof_indices / 1e6,
                  (unsigned long long)prof_index_direct, (unsigned long long)prof_index_copy, prof_vertex_bind / 1e6,
                  (unsigned long long)prof_vertex_direct, (unsigned long long)prof_vertex_copy);
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | direct heap range checks %llu (%llu cached, %.0f ms)",
-                 (unsigned long long)prof_heap_range_checks, (unsigned long long)prof_heap_range_cached,
-                 prof_heap_range_check_ns / 1e6);
-        n = strlen(stats_text);
+         n = strlen(stats_text);
+         snprintf(stats_text + n, sizeof stats_text - n, " | direct heap range checks %llu (%llu cached, %.0f ms)",
+                  (unsigned long long)prof_heap_range_checks, (unsigned long long)prof_heap_range_cached,
+                  prof_heap_range_check_ns / 1e6);
+         n = strlen(stats_text);
+         snprintf(stats_text + n, sizeof stats_text - n, " | pass restarts %llu (color %llu view %llu depth %llu)",
+                  (unsigned long long)stat_restart_n, (unsigned long long)stat_restart_color,
+                  (unsigned long long)stat_restart_view, (unsigned long long)stat_restart_depth);
+         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | pass ends:");
         for (int l = 0; l < 4096; l++)
             if (prof_end_line[l] > 20) { n = strlen(stats_text); snprintf(stats_text + n, sizeof stats_text - n, " %d:%u", l, prof_end_line[l]); }
@@ -1345,6 +1363,7 @@ const char *renderer_stats(void) {
         prof_program = prof_render_prep = prof_indices = prof_vertex_bind = 0;
         prof_index_direct = prof_index_copy = prof_vertex_direct = prof_vertex_copy = 0;
         prof_feedback_resolve = prof_scene_post = prof_snapshots = prof_gw_check = prof_begin_pass = 0;
+        stat_restart_n = stat_restart_color = stat_restart_view = stat_restart_depth = 0;
         prof_heap_range_checks = prof_heap_range_cached = prof_heap_range_check_ns = 0;
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
@@ -2747,6 +2766,8 @@ typedef struct Prog {
     ShaderKey vkey, fkey;
     VkShaderModule vs, fs;
     VkBindingInfo binds[MAX_BIND];
+    uint8_t bind_idx[2][MAX_BIND];  // (the binds of set 0 / 1, in bind order: vk_exec_stage_set scans only its own)
+    uint8_t bind_n[2];
     int nbinds;
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
@@ -3045,6 +3066,11 @@ static void compile_program(void *arg) {
     if (!b) { atomic_store(&p->state, 2); return; }
     p->nbinds = b->nbinds;
     memcpy(p->binds, b->binds, sizeof b->binds[0] * (size_t)b->nbinds);
+    p->bind_n[0] = p->bind_n[1] = 0;
+    for (int i = 0; i < p->nbinds; i++) {
+        int s = p->binds[i].set == 1 ? 1 : 0;
+        if (p->bind_n[s] < MAX_BIND) p->bind_idx[s][p->bind_n[s]++] = (uint8_t)i;
+    }
     p->vs = b->vs;
     p->fs = b->fs;
     p->set_layout[0] = b->set_layout[0];
@@ -4226,6 +4252,7 @@ static void resolve_feedback(Prog *pr) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
     if (off) return;
+    if (!pr->vi->ntex && !pr->fi->ntex) return;  // (samples nothing: no feedback loop, no texture scan)
     static struct { const ShaderInfo *vi, *fi; const void *tpool; uint64_t rt_gen, tgen0, tgen1; } rf_clean;
     if (rf_clean.vi == pr->vi && rf_clean.fi == pr->fi && rf_clean.tpool == st.tpool &&
         rf_clean.rt_gen == rt_gen && rf_clean.tgen0 == tex_gen[0] && rf_clean.tgen1 == tex_gen[1])
@@ -5981,7 +6008,8 @@ static void gw_check(const uint32_t cbufs[6], bool vertices, uint64_t iaddr, uin
     VkDeviceSize off;
     // (the overlap first: it is rarely there, and guest_direct is the dearer of the two)
     if (vertices && !wait && (chk_vbuf_gen != vbuf_gen || chk_vbuf_gw != gw_gen)) {
-        for (int i = 0; i < 16 && !wait; i++) {
+        int nv = st.nstream < 16 ? st.nstream : 16;  // (only the bound streams, not all 16 slots)
+        for (int i = 0; i < nv && !wait; i++) {
             Range v = st.vbuf[i];
             uint64_t n = v.size ? v.size : 256;
             if (v.addr && gw_overlaps(v.addr, v.addr + n)) wait = !guest_direct(v.addr, n, &b, &off);
@@ -7204,6 +7232,11 @@ static void build_compute(void *arg) {
     }
     cp->p.nbinds = c->nbinds;
     memcpy(cp->p.binds, c->binds, sizeof c->binds[0] * (size_t)c->nbinds);
+    cp->p.bind_n[0] = cp->p.bind_n[1] = 0;
+    for (int i = 0; i < cp->p.nbinds; i++) {
+        int s = cp->p.binds[i].set == 1 ? 1 : 0;
+        if (cp->p.bind_n[s] < MAX_BIND) cp->p.bind_idx[s][cp->p.bind_n[s]++] = (uint8_t)i;
+    }
     cp->p.set_layout[0] = c->set_layout;
     cp->p.layout = c->layout;
     cp->pipe = c->pipe;
@@ -7788,7 +7821,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         LOG("\n");
     }
     nfeedback = 0;
-    VkDescriptorSet ds = vk_exec_stage_set(cp->p.binds, cp->p.nbinds, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
+    VkDescriptorSet ds = vk_exec_stage_set(cp->p.binds, cp->p.bind_idx[0], cp->p.bind_n[0], cp->p.set_layout[0], 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     rec_CmdDispatch(cb, gx, gy, gz);
@@ -8277,7 +8310,7 @@ static void draw_(CmdRec *r, bool indexed) {
         prof_gw_check += now - prof_stage_start;
         prof_stage_start = now;
     }
-    begin_pass();
+    { PROFD_T0(); begin_pass(); PROFD_ADD(prof_begin_pass); }
     if (pass_void) { stat_skipped++; return; }
     // ---- motion vectors (mvec.c): an opaque draw of a pass with the motion target is recorded (its identity and the
     // vertex shader's inputs, for the next frame); matched with one of the previous frame, it is drawn with its motion
@@ -8601,7 +8634,7 @@ have_pipe:
     uint32_t dyn[64];
     int ndyn = 0;
     hud_clip = hud_cut = false;  // (hud_patch, while the vertex stage's constant buffers are bound)
-    VkDescriptorSet vset = vk_exec_stage_set(pr->binds, pr->nbinds, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
+    VkDescriptorSet vset = vk_exec_stage_set(pr->binds, pr->bind_idx[0], pr->bind_n[0], pr->set_layout[0], 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     PROFD_ADD(prof_sets);
     ProfZone pz4 = PZ_NOW();
     PZ_SPAN("exec/draw/sets", pz3, pz4);
@@ -8647,7 +8680,7 @@ have_pipe:
             up_fix.sx = (float)gb->width / (float)gt->width, up_fix.sy = (float)gb->height / (float)gt->height;
             up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
             ndyn = 0;  // (the vertex set again, with its constants: the first of the draw's dynamic offsets)
-            vset = vk_exec_stage_set(pr->binds, pr->nbinds, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
+            vset = vk_exec_stage_set(pr->binds, pr->bind_idx[0], pr->bind_n[0], pr->set_layout[0], 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
         }
     }
     if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
@@ -8739,7 +8772,7 @@ have_pipe:
         int i = g_cur_fs_hash == logged[0] ? -1 : !logged[0] ? 0 : g_cur_fs_hash == logged[1] ? -1 : !logged[1] ? 1 : -1;
         if (i >= 0) LOG("[fxaa] the game's FXAA off (fs hash %016llx)\n", (unsigned long long)(logged[i] = g_cur_fs_hash));
     }
-    VkDescriptorSet fset = vk_exec_stage_set(pr->binds, pr->nbinds, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
+    VkDescriptorSet fset = vk_exec_stage_set(pr->binds, pr->bind_idx[1], pr->bind_n[1], pr->set_layout[1], 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     sdw_fix.s = 0, up_fix.sx = 0, fxaa_off = false;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     PZ_SPAN("exec/draw/sets", pz6, PZ_NOW());
@@ -11341,7 +11374,25 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.has_dview = rt->has_dview;
             static int always = -1;
             if (always < 0) always = getenv("SAVAGEWIND_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) { st.rt_dirty = true; rt_gen++; }
+            if (always || memcmp(&prev, &st.rt, sizeof prev)) {
+                st.rt_dirty = true;
+                rt_gen++;
+                if (prof && !always) {  // (VK_PROF) why the pass restarts: the next pass-cache step needs this
+                    bool color = prev.ncolor != st.rt.ncolor, view = false;
+                    for (int i = 0; i < 8; i++) {
+                        if (prev.color[i] != st.rt.color[i]) color = true;
+                        if (prev.has_cview[i] != st.rt.has_cview[i] ||
+                            memcmp(&prev.cview[i], &st.rt.cview[i], sizeof prev.cview[i]))
+                            view = true;
+                    }
+                    bool depth = prev.depth != st.rt.depth || prev.has_dview != st.rt.has_dview ||
+                                 memcmp(&prev.dview, &st.rt.dview, sizeof prev.dview);
+                    stat_restart_n++;
+                    stat_restart_color += color;
+                    stat_restart_view += view;
+                    stat_restart_depth += depth;
+                }
+            }
             if (nfbrun && memcmp(&prev, &st.rt, sizeof prev)) fbdump_flush();
             if (logfb > 0 && !fbskip && memcmp(&prev, &st.rt, sizeof prev))
                 LOG("[feedback] targets %d (%ux%u fmt %#x) depth %d after %u draws\n", st.rt.ncolor, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,

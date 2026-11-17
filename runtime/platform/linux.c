@@ -105,6 +105,15 @@ static int core_first(int cpu, const cpu_set_t *all) {
     return first;
 }
 
+int plat_cpu_cores(void) {
+    cpu_set_t all;
+    if (sched_getaffinity(0, sizeof all, &all)) return plat_cpu_count();
+    int cores = 0;
+    for (int c = 0; c < CPU_SETSIZE; c++)
+        if (CPU_ISSET(c, &all) && core_first(c, &all) == c) cores++;
+    return cores > 0 ? cores : plat_cpu_count();
+}
+
 // One logical processor per physical core, as on Windows (runtime/platform/windows.c): the first of each core's
 // SMT siblings within the process's affinity, set on every thread the process has so far (later ones inherit it).
 void plat_cpu_placement(void) {

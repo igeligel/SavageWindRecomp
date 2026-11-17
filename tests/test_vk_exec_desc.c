@@ -165,12 +165,15 @@ static VkBindingInfo vbinds[VBINDS] = {
 
 #define FBINDS (6 + 16)
 static VkBindingInfo fbinds[FBINDS];
+static uint8_t vidx[VBINDS], fidx[FBINDS];  // (the bindings per set, as exec.c keeps them)
 
 static VkDescriptorSetLayout vlayout = (VkDescriptorSetLayout)(uintptr_t)0x400;
 static VkDescriptorSetLayout flayout = (VkDescriptorSetLayout)(uintptr_t)0x401;
 static uint32_t fanisotropy;
 
 static void setup(void) {
+    for (int i = 0; i < VBINDS; i++) vidx[i] = (uint8_t)i;
+    for (int i = 0; i < FBINDS; i++) fidx[i] = (uint8_t)i;
     memset(&si_vertex, 0, sizeof si_vertex);
     memset(&si_fragment, 0, sizeof si_fragment);
     memset(&si_cbuf, 0, sizeof si_cbuf);
@@ -305,7 +308,7 @@ static void run_stage_vertex(void) {
     uintptr_t acc = 0;
     for (int i = 0; i < REP_SET; i++) {
         ndyn = 0;
-        acc ^= (uintptr_t)vk_exec_stage_set(vbinds, VBINDS, vlayout, 0, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
+        acc ^= (uintptr_t)vk_exec_stage_set(vbinds, vidx, VBINDS, vlayout, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
     }
     sink ^= acc;
 }
@@ -315,7 +318,7 @@ static void run_stage_fragment(void) {
     uintptr_t acc = 0;
     for (int i = 0; i < REP_SET; i++) {
         ndyn = 0;
-        acc ^= (uintptr_t)vk_exec_stage_set(fbinds, FBINDS, flayout, 1, 1, &si_fragment, NULL, tint, 0, 0, 0, NULL, dynbuf, &ndyn);
+        acc ^= (uintptr_t)vk_exec_stage_set(fbinds, fidx, FBINDS, flayout, 1, &si_fragment, NULL, tint, 0, 0, 0, NULL, dynbuf, &ndyn);
     }
     sink ^= acc;
 }
@@ -325,9 +328,9 @@ static void run_stage_both(void) {
     float tint[8] = {0.25f, 0.5f, 0.75f, 1, 0, 0, 0, 0};
     for (int i = 0; i < REP_BOTH; i++) {
         ndyn = 0;
-        acc ^= (uintptr_t)vk_exec_stage_set(vbinds, VBINDS, vlayout, 0, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
+        acc ^= (uintptr_t)vk_exec_stage_set(vbinds, vidx, VBINDS, vlayout, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
         ndyn = 0;
-        acc ^= (uintptr_t)vk_exec_stage_set(fbinds, FBINDS, flayout, 1, 1, &si_fragment, NULL, tint, 0, 0, 0, NULL, dynbuf, &ndyn);
+        acc ^= (uintptr_t)vk_exec_stage_set(fbinds, fidx, FBINDS, flayout, 1, &si_fragment, NULL, tint, 0, 0, 0, NULL, dynbuf, &ndyn);
     }
     sink ^= acc;
 }
@@ -378,10 +381,10 @@ static void realistic_frame(int draws, int frames, int reuse_pct, const char *la
             int m = pick_material(reuse_pct), p = pick_program();
             set_draw_state(m, p);
             ndyn = 0;
-            sink ^= (uintptr_t)vk_exec_stage_set(vbinds, VBINDS, vlayout, 0, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL,
+            sink ^= (uintptr_t)vk_exec_stage_set(vbinds, vidx, VBINDS, vlayout, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL,
                                                  dynbuf, &ndyn);
             ndyn = 0;
-            sink ^= (uintptr_t)vk_exec_stage_set(fbinds, FBINDS, flayout, 1, 1, &si_fragment, NULL, mat_tint[m], 0, 0, 0,
+            sink ^= (uintptr_t)vk_exec_stage_set(fbinds, fidx, FBINDS, flayout, 1, &si_fragment, NULL, mat_tint[m], 0, 0, 0,
                                                  NULL, dynbuf, &ndyn);
         }
     }
@@ -401,7 +404,7 @@ int main(int argc, char **argv) {
 
     // The dynamic buffers come out by binding (4 before 5), whatever the order of the bindings.
     ndyn = 0;
-    VkDescriptorSet ds = vk_exec_stage_set(vbinds, VBINDS, vlayout, 0, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
+    VkDescriptorSet ds = vk_exec_stage_set(vbinds, vidx, VBINDS, vlayout, 0, &si_vertex, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn);
     assert(ds != VK_NULL_HANDLE);
     assert(ndyn == 2);
     assert(dynbuf[0] == 0x2000 && dynbuf[1] == 0x3000);  // cbuf 4: ubuf[1]; cbuf 5: ubuf[2]
@@ -414,7 +417,7 @@ int main(int argc, char **argv) {
     assert(a == b && stat_sets_reused == reused + 1);
 
     ndyn = 0;
-    assert(vk_exec_stage_set(fbinds, FBINDS, flayout, 1, 1, &si_fragment, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn) != VK_NULL_HANDLE);
+    assert(vk_exec_stage_set(fbinds, fidx, FBINDS, flayout, 1, &si_fragment, NULL, NULL, 0, 0, 0, NULL, dynbuf, &ndyn) != VK_NULL_HANDLE);
     assert(ndyn == 1);
 
     if (!run_bench) {

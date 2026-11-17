@@ -119,12 +119,15 @@ static SetEnt *setc;
 // put here, so a one-off set pays just the probe, not the key copy. Misses fall through to the hash table.
 #define SETP_TAB 32
 #define SETP_WAYS 4
-typedef struct {
+// Sets with more bindings than this skip the probe (the hash table still shares them): a full MAX_BIND key made each of
+// the 128 ways 3 KB, ~390 KB with the 192 KB table, and every submission starts the probe over (the sets die with it).
+#define SETP_KEY_BIND 32
+typedef struct __attribute__((aligned(64))) {
     uint64_t seq, tag;
     VkDescriptorSetLayout layout;
     uint32_t n;
     VkDescriptorSet set;
-    uint64_t key[4 * MAX_BIND];
+    uint64_t key[4 * SETP_KEY_BIND];
 } SetProbe;
 static SetProbe setp[SETP_TAB][SETP_WAYS];
 static uint32_t setp_next[SETP_TAB];
@@ -147,8 +150,16 @@ static void set_key(const VkWriteDescriptorSet *w, int n, uint64_t *key) {
 
 static uint64_t set_tag(const VkWriteDescriptorSet *w, int n, VkDescriptorSetLayout layout) {
     uint64_t tag = (uint64_t)(uintptr_t)layout ^ (uint64_t)n;
-    for (int i = 0; i < n; i++) {
-        if (n > 4 && i >= 2 && i < n - 2) continue;  // (first 2 and last 2: a cheap sample of the contents)
+    int idx[4], m;
+    if (n <= 4) {
+        for (int i = 0; i < n; i++) idx[i] = i;
+        m = n;
+    } else {  // (first 2 and last 2: a cheap sample of the contents; no pass over the middle)
+        idx[0] = 0; idx[1] = 1; idx[2] = n - 2; idx[3] = n - 1;
+        m = 4;
+    }
+    for (int j = 0; j < m; j++) {
+        const int i = idx[j];
         uint64_t v[4];
         v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
         if (w[i].pImageInfo) {
@@ -173,14 +184,16 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
     SetEnt *e = NULL;
     SetProbe *pp = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0, tag = 0;
+    const bool probe_ok = !off && !no_desc && n <= SETP_KEY_BIND;
+    uint64_t key[4 * SETP_KEY_BIND];
     if (!off) {
-        if (!no_desc) {
+        if (probe_ok) {
             tag = set_tag(w, n, layout);
             SetProbe *ways = setp[tag & (SETP_TAB - 1)];
             for (int way = 0; way < SETP_WAYS; way++) {
                 pp = &ways[way];
                 if (pp->seq == seq && pp->layout == layout && pp->n == (uint32_t)n && pp->tag == tag) {
-                    uint64_t key[4 * MAX_BIND];
+                    __builtin_prefetch(pp->key, 0, 3);  // (start the key's lines while set_key fills ours)
                     set_key(w, n, key);
                     if (!memcmp(pp->key, key, (size_t)n * 4 * sizeof key[0])) {
                         stat_sets_reused++;
@@ -204,6 +217,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[2] = w[i].pBufferInfo->offset;
                 v[3] = w[i].pBufferInfo->range;
             }
+            if (probe_ok) memcpy(&key[4 * i], v, sizeof v);  // (kept for the probe insert: no second set_key pass)
             set_hash_add(&h, &h2, v);
         }
         h ^= h >> 32;
@@ -211,15 +225,13 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
         if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
             stat_sets_reused++;
-            if (!no_desc) {
+            if (probe_ok) {
                 uint32_t idx = tag & (SETP_TAB - 1);
                 SetProbe *ways = setp[idx];
                 pp = NULL;
                 for (int way = 0; way < SETP_WAYS; way++)
                     if (ways[way].seq != seq) { pp = &ways[way]; break; }
                 if (!pp) pp = &ways[setp_next[idx]++ & (SETP_WAYS - 1)];
-                uint64_t key[4 * MAX_BIND];
-                set_key(w, n, key);
                 pp->seq = seq; pp->tag = tag; pp->layout = layout; pp->n = (uint32_t)n; pp->set = e->set;
                 memcpy(pp->key, key, (size_t)n * 4 * sizeof key[0]);
             }
@@ -240,7 +252,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
 // dyn / ndyn: the offsets of its dynamic uniform buffers, by binding (ubo_dynamic_mark), appended.
-VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDescriptorSetLayout layout, uint32_t set,
+VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, const uint8_t *idx, int nsel, VkDescriptorSetLayout layout,
                                   int stage, ShaderInfo *si, const float *rscale_row0, const float tint[8], uint32_t gx,
                                   uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, int *ndyn) {
     vk_exec_gmem_stage_prepare(stage, si);
@@ -251,6 +263,7 @@ VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDesc
     VkDescriptorImageInfo ii[MAX_BIND];
     int n = 0;
     int sg = stage == 1 ? 1 : 0;
+    const VkBindingInfo *rs_b = NULL, *tint_b = NULL;  // (the rscale / tint writes: built after the textures are known)
     // The scale table: row 0, then one per texture (translate.c reads rscale[1 + slot], slot < ntex). Only those rows
     // are filled, compared and copied: the whole 65-row table, zeroed, compared and copied twice a draw (~8000 times a
     // frame in the open world), was a share of the translation thread's time. The span keeps the declared size.
@@ -258,9 +271,8 @@ VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDesc
     float rs[65][4];
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     else rs[0][0] = rs[0][1] = 1, rs[0][2] = rs[0][3] = 0;
-    for (int i = 0; i < nbinds; i++) {
-        const VkBindingInfo *b = &binds[i];
-        if (b->set != set) continue;
+    for (int j = 0; j < nsel; j++) {
+        const VkBindingInfo *b = &binds[idx[j]];
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
@@ -295,23 +307,26 @@ VkDescriptorSet vk_exec_stage_set(const VkBindingInfo *binds, int nbinds, VkDesc
                                                        : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
+            if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == 18) rs_b = b;
+            else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == 19) tint_b = b;
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
         }
         n++;
     }
-    for (int i = 0; i < nbinds; i++) {
-        const VkBindingInfo *b = &binds[i];
-        if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || (b->binding != 18 && b->binding != 19)) continue;
-        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
-                                      .descriptorCount = 1, .descriptorType = b->type};
-        if (b->binding == 18) {
-            for (int t = 0; t < si->ntex && t < 64; t++)
-                rs[1 + t][0] = tex_sc[sg][t][0], rs[1 + t][1] = tex_sc[sg][t][1], rs[1 + t][2] = rs[1 + t][3] = 0;
-            bi[n] = ubo_span(copy_dedupe_in(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, (uint64_t)rows * 16, sizeof rs, 256), sizeof rs);
-        } else {
-            float zero[8] = {0};
-            bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
-        }
+    if (rs_b) {
+        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = rs_b->binding,
+                                      .descriptorCount = 1, .descriptorType = rs_b->type};
+        for (int t = 0; t < si->ntex && t < 64; t++)
+            rs[1 + t][0] = tex_sc[sg][t][0], rs[1 + t][1] = tex_sc[sg][t][1], rs[1 + t][2] = rs[1 + t][3] = 0;
+        bi[n] = ubo_span(copy_dedupe_in(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, (uint64_t)rows * 16, sizeof rs, 256), sizeof rs);
+        w[n].pBufferInfo = &bi[n];
+        n++;
+    }
+    if (tint_b) {
+        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = tint_b->binding,
+                                      .descriptorCount = 1, .descriptorType = tint_b->type};
+        float zero[8] = {0};
+        bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
         w[n].pBufferInfo = &bi[n];
         n++;
     }

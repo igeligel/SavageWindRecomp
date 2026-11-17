@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 
@@ -65,6 +66,13 @@ void plat_sleep_until_ns(uint64_t t) {
 void plat_wait_until_ns(uint64_t t) { plat_sleep_until_ns(t); }  // (mach_wait_until doesn't spin)
 
 int plat_cpu_count(void) { int n = (int)sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? n : 1; }
+
+int plat_cpu_cores(void) {
+    int n = 0;
+    size_t sz = sizeof n;
+    if (sysctlbyname("hw.physicalcpu", &n, &sz, NULL, 0) == 0 && n > 0) return n;
+    return plat_cpu_count();
+}
 
 void plat_cpu_placement(void) {}  // (one logical processor per core: measured on Windows only)
 

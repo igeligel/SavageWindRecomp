@@ -445,6 +445,7 @@ void plat_init(void) {
 // execution slots and forcing critical threads onto low-clock E-cores. Under Wine / Proton the Linux kernel schedules
 // the threads, and there the Steam Deck measured one processor per core as a loss (platform.h): the default keeps
 // every logical processor, as the Linux build does.
+static int g_cpu_cores;  // (plat_cpu_placement: the physical cores within the process's affinity)
 void plat_cpu_placement(void) {
     DWORD_PTR all, sys, one = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &all, &sys)) return;
@@ -469,6 +470,7 @@ void plat_cpu_placement(void) {
             o += e->Size;
         }
     free(buf);
+    g_cpu_cores = cores;
     bool hybrid = (cores > 0 && min_eff != max_eff);
     const char *x = getenv("SAVAGEWIND_ONE_PER_CORE");
     bool on = one && (x ? atoi(x) != 0 : !wine && !hybrid && plat_one_per_core_default(cores, logical));
@@ -486,6 +488,8 @@ int plat_cpu_count(void) {
     GetSystemInfo(&si);
     return (int)si.dwNumberOfProcessors;
 }
+
+int plat_cpu_cores(void) { return g_cpu_cores > 0 ? g_cpu_cores : plat_cpu_count(); }
 
 const char *plat_log_path(void) { return g_log_path; }
 

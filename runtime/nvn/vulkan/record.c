@@ -162,8 +162,9 @@ static inline void *after(const void *args, size_t args_size) { return (uint8_t 
 // ---- the thread
 // R spins this long for the next packets before it sleeps: T hands it a few KB every 50-100 us while it translates
 // a list, and each of those finds R asleep otherwise, a wake-up syscall (~6 us on T, ~25 us before R runs). On CPUs
-// with fewer than 6 logical processors R sleeps at once, as before. SAVAGEWIND_VK_RECORDER_SPIN=<us> (0: never sleeps
-// late; default 60).
+// with fewer than 6 physical cores R sleeps at once, as before: SMT siblings do not give the spin a core of its own,
+// and on a 15 W handheld (4 cores, 8 threads) that spin took ~0.3-0.5 of a core and the APU's power budget from the
+// GPU. SAVAGEWIND_VK_RECORDER_SPIN=<us> (0: never sleeps late; default 60).
 static uint64_t spin_ns;
 #if defined(__x86_64__) || defined(__i386__)
 #define RELAX() __builtin_ia32_pause()
@@ -222,10 +223,10 @@ void rec_init(void) {
     {
         const char *sp = getenv("SAVAGEWIND_VK_RECORDER_SPIN");
         long us = sp ? atol(sp) : 60;
-        if (!sp && plat_cpu_count() < 6) us = 0;
+        if (!sp && plat_cpu_cores() < 6) us = 0;  // (physical cores: the Deck's 4 cores/8 threads spin otherwise)
         spin_ns = us > 0 ? (uint64_t)us * 1000 : 0;
     }
-    // Where R sleeps at once (no spin: fewer than 6 logical processors), each publish of 4 KB woke it, a syscall on T
+    // Where R sleeps at once (no spin: fewer than 6 physical cores), each publish of 4 KB woke it, a syscall on T
     // (6.7% of T's busy time, 4 cores, Rito): 64 KB there (RTX 3060 limited to 4 cores at 720p: Rito 102 -> 106 fps,
     // castle 149 -> 153; 2 cores / 4 threads: Rito 76 -> 81, castle 105 -> 110). Submissions and waits still publish
     // at once. With the spin, the same either way. SAVAGEWIND_VK_PUBLISH_KB=<KB> sets it.
@@ -328,8 +329,8 @@ void rec_stats_take(RecStats *o) {
 #define ENQ_END() do { if (prof_enq) st_t.enqueue_ns += NOW() - enq_t0_; } while (0)
 
 // ================================================================== descriptor writes
-static bool write_is_image(const VkWriteDescriptorSet *w) {
-    switch (w->descriptorType) {
+static bool desc_is_image(VkDescriptorType type) {
+    switch (type) {
     case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
     case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
         return true;
@@ -337,31 +338,40 @@ static bool write_is_image(const VkWriteDescriptorSet *w) {
     }
 }
 typedef union { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; } WriteInfo;
-typedef struct { uint32_t n; } UpdateArgs;  // then: n VkWriteDescriptorSet, then n WriteInfo
+// The compact form of a VkWriteDescriptorSet (40 bytes against 64) plus the info it points at (24): the recorder
+// rebuilds the Vulkan struct, so the render thread copies less into the ring.
+typedef struct { VkDescriptorSet set; uint32_t binding, elem; VkDescriptorType type; WriteInfo info; } CompactWrite;
+typedef struct { uint32_t n; } UpdateArgs;  // then: n CompactWrite
 static void update_sets_run(const void *p) {
     const UpdateArgs *a = p;
-    VkWriteDescriptorSet *w = after(a, sizeof *a);
-    const WriteInfo *inf = after(w, a->n * sizeof *w);
+    const CompactWrite *cw = after(a, sizeof *a);
+    VkWriteDescriptorSet wbuf[128], *w = a->n <= 128 ? wbuf : malloc((size_t)a->n * sizeof *w);
+    if (!w) FATAL("[vk] recorder: out of memory for %u descriptor writes\n", a->n);
     for (uint32_t i = 0; i < a->n; i++) {
-        if (write_is_image(&w[i])) w[i].pImageInfo = &inf[i].i;
-        else w[i].pBufferInfo = &inf[i].b;
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = cw[i].set,
+                                      .dstBinding = cw[i].binding, .dstArrayElement = cw[i].elem,
+                                      .descriptorCount = 1, .descriptorType = cw[i].type};
+        if (desc_is_image(cw[i].type)) w[i].pImageInfo = &cw[i].info.i;
+        else w[i].pBufferInfo = &cw[i].info.b;
     }
     vkUpdateDescriptorSets(g_vk.dev, a->n, w, 0, NULL);
+    if (w != wbuf) free(w);
 }
 void rec_UpdateDescriptorSets(uint32_t n, const VkWriteDescriptorSet *w) {
     if (on <= 0) { vkUpdateDescriptorSets(g_vk.dev, n, w, 0, NULL); return; }
     ENQ_T0();
-    UpdateArgs *a = push(update_sets_run, sizeof *a, AL16(n * sizeof *w) + n * sizeof(WriteInfo));
+    UpdateArgs *a = push(update_sets_run, sizeof *a, n * sizeof(CompactWrite));
     a->n = n;
-    VkWriteDescriptorSet *pw = after(a, sizeof *a);
-    WriteInfo *inf = after(pw, n * sizeof *pw);
+    CompactWrite *cw = after(a, sizeof *a);
     for (uint32_t i = 0; i < n; i++) {
         if (w[i].descriptorCount != 1 || w[i].pNext || w[i].pTexelBufferView)
             FATAL("[vk] recorder: a descriptor write it can't carry (%u descriptors)\n", w[i].descriptorCount);
-        pw[i] = w[i];
-        if (write_is_image(&w[i])) inf[i].i = *w[i].pImageInfo;
-        else inf[i].b = *w[i].pBufferInfo;
-        pw[i].pImageInfo = NULL; pw[i].pBufferInfo = NULL;  // (set again when run)
+        cw[i].set = w[i].dstSet;
+        cw[i].binding = w[i].dstBinding;
+        cw[i].elem = w[i].dstArrayElement;
+        cw[i].type = w[i].descriptorType;
+        if (desc_is_image(w[i].descriptorType)) cw[i].info.i = *w[i].pImageInfo;
+        else cw[i].info.b = *w[i].pBufferInfo;
     }
     commit();
     ENQ_END();
