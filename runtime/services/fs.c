@@ -31,6 +31,7 @@
 #include "../music_volume.h"
 #include "archive.h"
 #include "fs_layout.h"
+#include "fs_savedata.h"
 #include "save_profiles.h"
 #include "../mods.h"
 #include "../perfcount.h"
@@ -2170,7 +2171,7 @@ static Service *open_aoc_storage(int index) {
 
 // ------------------------------------------------------------------ host-directory filesystem
 typedef struct { char root[1024]; } HostFs;
-typedef struct { int fd; char path[1100]; uint8_t *patched; uint64_t patched_size; bool written, save_written; } HostFile;  // (written: since its last Flush)
+typedef struct { int fd; char path[1100]; uint8_t *patched; uint64_t patched_size; bool written, save_written, is_savedata; } HostFile;  // (written: since its last Flush)
 
 // The game wrote a file of a save (game_data.sav, or caption.sav next to it: Master Mode's mark): the achievements
 // read the save now, as played - before the game may load it back (after Ganon's end it does at once)
@@ -2310,7 +2311,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
             perfcount_add(PC_FILE_READS, 1), perfcount_add(PC_FILE_NS, plat_now_ns() - ft0);
             if (n > 0) perfcount_add(PC_FILE_BYTES, (uint64_t)n);
         }
-        if (strstr(f->path, "savedata")) {
+        if (f->is_savedata) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
         }
         OUT(int64_t, 0) = n < 0 ? 0 : n;
@@ -2320,7 +2321,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
     case 1: {  // Write(option, offset, size) <- A
         int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
         IpcBuf *a = in_buf(req, 0);
-        if (strstr(f->path, "savedata"))
+        if (f->is_savedata)
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
         int tries = 0;
         ssize_t w;
@@ -2475,6 +2476,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         strlcpy(f->path, p, sizeof f->path);
+        f->is_savedata = fs_savedata_path(f->path);
         size_t pl = strlen(p);
         f->save_written = (mode & 2) && ((pl >= 13 && !strcmp(p + pl - 13, "game_data.sav")) ||
                                          (pl >= 11 && !strcmp(p + pl - 11, "caption.sav")));

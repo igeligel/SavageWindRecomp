@@ -746,6 +746,20 @@ test-save-profiles: $(B)/test_save_profiles
 
 .PHONY: test-save-profiles
 
+# The save hot path's savedata gate (runtime/services/fs_savedata.h): the answer the file service now computes once at
+# open, checked against the old per-operation scan on autosave-shaped traces, plus the two candidates' benchmark.
+$(B)/test_fs_savedata: tools/test_fs_savedata.c runtime/services/fs_savedata.h
+	@mkdir -p $(B)
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_fs_savedata.c
+
+test-fs-savedata: $(B)/test_fs_savedata
+	$(B)/test_fs_savedata
+
+bench-fs-savedata: $(B)/test_fs_savedata
+	$(B)/test_fs_savedata --bench
+
+.PHONY: test-fs-savedata bench-fs-savedata
+
 $(B)/test_mods: tools/test_mods.c runtime/mods.c runtime/mods.h
 	@mkdir -p $(B)
 	$(CC) -O1 -Wall -Wextra -Werror -std=gnu11 -D_FILE_OFFSET_BITS=64 -Iruntime -o $@ tools/test_mods.c runtime/mods.c
