@@ -31,6 +31,7 @@
 #include "../music_volume.h"
 #include "archive.h"
 #include "fs_layout.h"
+#include "fs_overlay.h"
 #include "save_profiles.h"
 #include "../mods.h"
 #include "../perfcount.h"
@@ -45,7 +46,7 @@
 const char *g_save_dir = "save";
 
 // ------------------------------------------------------------------ RomFS file index (offset -> path)
-typedef struct { uint64_t start, size; char *path; int fd; const uint8_t *mem; } Overlay;
+// (the appended region's Overlay entries and their lookup: fs_overlay.h)
 // in-image patches (copies of RomFS tables with changes): header, dir meta, file hash, file meta
 typedef struct { uint64_t off, size; uint8_t *data; } Patch;
 // Lets the runtime see which game files are being streamed (e.g. which level is loading).
@@ -1925,10 +1926,9 @@ static ssize_t romfs_read(RomImage *m, uint8_t *dst, uint64_t size, uint64_t off
     while (done < size) {
         uint64_t o = off + done, n = size - done;
         if (m->ov_n && o >= m->ov[0].start) {  // appended region
-            int i = 0;
-            while (i < m->ov_n && !(o >= m->ov[i].start && o < m->ov[i].start + ((m->ov[i].size + 0xF) & ~0xFull))) i++;
-            if (i == m->ov_n) { memset(dst + done, 0, n); done += n; break; }
-            uint64_t in = o - m->ov[i].start, avail = ((m->ov[i].size + 0xF) & ~0xFull) - in;
+            int i = ov_find(m->ov, m->ov_n, o);
+            if (i < 0) { memset(dst + done, 0, n); done += n; break; }
+            uint64_t in = o - m->ov[i].start, avail = ov_span(m->ov[i].size) - in;
             if (n > avail) n = avail;
             ssize_t r;
             if (m->ov[i].mem) {  // in-memory blob (the extended file table)

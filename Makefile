@@ -724,6 +724,20 @@ test-swkbd: $(B)/test_swkbd
 
 .PHONY: test-swkbd
 
+# The appended RomFS region's lookup (runtime/services/fs_overlay.h): every offset of small layouts against a per-byte
+# owner map, realistic large layouts against an independent oracle, plus the candidates' benchmark.
+$(B)/test_romfs_overlay: tools/test_romfs_overlay.c runtime/services/fs_overlay.h
+	@mkdir -p $(B)
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_romfs_overlay.c
+
+test-romfs-overlay: $(B)/test_romfs_overlay
+	$(B)/test_romfs_overlay
+
+bench-romfs-overlay: $(B)/test_romfs_overlay
+	$(B)/test_romfs_overlay --bench
+
+.PHONY: test-romfs-overlay bench-romfs-overlay
+
 # The Wii U / Cemu save importer against tools/botw_save_convert.py: both convert synthetic saves and every output file
 # is compared (no game files needed). With your own: python3 tools/test_save_convert.py --src <profile> --bootup <pack>
 $(B)/test_save_convert: tools/test_save_convert.c runtime/services/save_convert.c runtime/services/save_convert.h runtime/services/archive.c runtime/services/archive.h
