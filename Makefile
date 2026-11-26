@@ -615,6 +615,20 @@ test-output-scale: $(B)/test_output_scale
 
 .PHONY: test-output-scale
 
+# The shader archive's BNSH/grsc magic scan (runtime/nvn/shader_archive.c): synthetic buffers only. --bench runs the
+# previous every-4-bytes memcmp scan against the memchr-driven one on the same buffers.
+$(B)/test_shader_archive_scan: tests/test_shader_archive_scan.c runtime/nvn/shader_archive.c $(RT_HDRS)
+	@mkdir -p $(B)
+	$(CC) -O2 $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -o $@ tests/test_shader_archive_scan.c -lpthread -lm
+
+test-shader-archive: $(B)/test_shader_archive_scan
+	$(B)/test_shader_archive_scan
+
+bench-shader-scan: $(B)/test_shader_archive_scan
+	$(B)/test_shader_archive_scan --bench
+
+.PHONY: test-shader-archive bench-shader-scan
+
 $(B)/test_window_size: tests/test_window_size.c runtime/window_size.c $(RT_HDRS)
 	@mkdir -p $(B)
 	$(CC) -O1 -DSDL_STATIC_LIB $(OSFLAGS) $(DEPINC) -Iruntime -o $@ tests/test_window_size.c runtime/window_size.c -lSDL3 -lpthread -lm

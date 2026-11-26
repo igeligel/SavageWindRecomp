@@ -103,14 +103,47 @@ static void add_program(SaSet *set, int vs, int fs, int cs, int source) {
     set->programs[set->nprograms++] = (SaProgram){vs, fs, cs, (uint16_t)source};
 }
 
+// The first 4-byte magic at a 4-byte aligned offset in [from, limit), or NULL. d has n readable bytes; reads at most 4
+// at a candidate. These magics used to be found by comparing every 4-byte word: over a 128 MB data segment that is tens
+// of millions of compares, so skip to each occurrence of the magic's first byte (memchr is vectorized) and still accept
+// only aligned matches, as the old stride did.
+static const uint8_t *find_magic(const uint8_t *d, size_t n, size_t from, size_t limit, const char *magic) {
+    size_t end = n >= 4 ? n - 3 : 0;  // (a candidate at o needs o + 4 <= n)
+    if (end > limit) end = limit;
+    size_t o = (from + 3) & ~(size_t)3;
+    if (o >= end) return NULL;
+    // The first byte is usually sparse, but in a run of it a memchr per occurrence costs more than the old stride;
+    // sample the range and keep the stride where it is dense.
+    size_t sample = end - o;
+    if (sample > 1024) sample = 1024;
+    if (sample >= 16) {
+        size_t hits = 0;
+        for (size_t i = 0; i < sample; i++) hits += d[o + i] == (uint8_t)magic[0];
+        if (hits * 64 >= sample) {
+            for (; o < end; o += 4)
+                if (!memcmp(d + o, magic, 4)) return d + o;
+            return NULL;
+        }
+    }
+    while (o < end) {
+        const uint8_t *p = memchr(d + o, magic[0], end - o);
+        if (!p) break;
+        size_t k = ((size_t)(p - d) + 3) & ~(size_t)3;
+        if (k >= end) break;
+        if (!memcmp(d + k, magic, 4)) return d + k;
+        o = k + 4;
+    }
+    return NULL;
+}
+
 // ------------------------------------------------------------------ BNSH (nn::gfx shader file)
 // Offsets in it are relative to its start. grsc (shader container): +0x1C variation count, +0x20 variation array
 // (0x40 bytes each, +0x10 the binary program). Program: +8 + 8 * stage the code of vertex, hull, domain, geometry,
 // pixel, compute. Code (NVN): +8 control, +0x10 data, +0x18 data size, +0x1C control size.
 static void bnsh(SaSet *set, const uint8_t *d, size_t n, int source) {
-    const uint8_t *g = NULL;
-    for (size_t o = 4; o + 0x30 <= n && o < 0x200; o += 4)
-        if (!memcmp(d + o, "grsc", 4)) { g = d + o; break; }
+    size_t end = n >= 0x30 ? n - 0x30 + 1 : 0;  // (the old stride needed o + 0x30 <= n and o < 0x200)
+    if (end > 0x200) end = 0x200;
+    const uint8_t *g = find_magic(d, n, 4, end, "grsc");
     if (!g) return;
     uint32_t nvar = rd32(g + 0x1C);
     uint64_t varr = rd64(g + 0x20);
@@ -136,8 +169,13 @@ static void bnsh(SaSet *set, const uint8_t *d, size_t n, int source) {
 }
 
 static void bnsh_all(SaSet *set, const uint8_t *d, size_t n, int source) {  // (inside FSHA, VFXB)
-    for (size_t o = 0; o + 0x100 <= n; o += 4)
-        if (!memcmp(d + o, "BNSH", 4)) bnsh(set, d + o, n - o, source);
+    size_t end = n >= 0x100 ? n - 0x100 + 1 : 0;  // (the old stride stopped before the last 0xFF bytes)
+    for (const uint8_t *p = find_magic(d, n, 0, end, "BNSH"); p;) {
+        size_t o = (size_t)(p - d);
+        bnsh(set, p, n - o, source);
+        o += 4;  // (the old stride looked again right after a match)
+        p = o < end ? find_magic(d, n, o, end, "BNSH") : NULL;
+    }
 }
 
 // ------------------------------------------------------------------ agl shader archive (SHARCB, "BAHS")
