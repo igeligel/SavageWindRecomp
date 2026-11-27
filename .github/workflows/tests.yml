@@ -27,6 +27,7 @@ jobs:
     outputs:
       i18n: ${{ steps.filter.outputs.i18n }}
       layout: ${{ steps.filter.outputs.layout }}
+      spirv: ${{ steps.filter.outputs.spirv }}
       astc: ${{ steps.filter.outputs.astc }}
       simd: ${{ steps.filter.outputs.simd }}
       translate: ${{ steps.filter.outputs.translate }}
@@ -45,6 +46,11 @@ jobs:
               - '.github/workflows/tests.yml'
             layout:
               - 'tools/*.py'
+              - '.github/workflows/tests.yml'
+            spirv:
+              - 'runtime/nvn/vulkan/spirv.c'
+              - 'runtime/nvn/vulkan/shaders/**'
+              - 'tests/test_spirv_cache.c'
               - '.github/workflows/tests.yml'
             astc:
               - 'runtime/nvn/astc.c'
@@ -94,6 +100,18 @@ jobs:
           enable-cache: true
           cache-dependency-glob: .github/workflows/tests.yml
       - run: uv run --no-project --with lz4 --with capstone --with unicorn python tools/test_layout.py
+
+  # The SPIR-V cache key, the disk round-trip's malformed files and the ensure/compile handoff, with a fake compiler:
+  # no Vulkan device, shaderc or game data (only zlib).
+  spirv:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.spirv == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends zlib1g-dev
+      - run: make test-spirv
 
   # runtime/nvn/astc.c against ARM's astcenc. test_astc.sh clones astcenc's default branch when build/astc-encoder is
   # missing; a pinned release here keeps the reference the same between runs.

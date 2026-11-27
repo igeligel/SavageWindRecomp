@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "vk.h"
+#include "shaders/cache_path.h"
 
 typedef struct { uint32_t set, binding; VkDescriptorType type; } VkBindingInfo;
 
@@ -46,11 +47,8 @@ uint32_t vk_sph_inputs(const uint8_t *code, int stage);
 typedef struct { uint64_t code; uint32_t stage, bin_size; ShaderKey key; } VkKeyLogEntry;
 int vk_keylog_read(VkKeyLogEntry **out);  // malloc'd copy
 void vk_keylog_flush(void);
-// cache/ (or SAVAGEWIND_CACHE_DIR): out = that folder + "/" + name
-const char *vk_cache_dir(void);
-const char *vk_cache_dir_id(const char *id);  // a folder name for a translator / SPIR-V id
+// cache/ (or SAVAGEWIND_CACHE_DIR) and a build id's folder name: shaders/cache_path.h
 void vk_cache_cleanup(void);                  // other builds' translations and SPIR-V removed (in the background)
-void vk_cache_path(char *out, size_t n, const char *name);
 // What caches of translated shaders are valid for: the translator's id and the GLSL -> SPIR-V step's (spirv.c); the
 // full one adds the device's translation variant (maxwell_translation_variant): what a precompilation was made under.
 const char *vk_shader_version(void);

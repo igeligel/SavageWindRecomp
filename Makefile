@@ -68,8 +68,8 @@ RT_SRC   := $(filter-out runtime/control.c runtime/control_game.c,$(wildcard run
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) \
-            $(wildcard runtime/nvn/vulkan/exec/*.h) $(wildcard runtime/ui/*.h) \
-            $(wildcard runtime/services/*.h)
+            $(wildcard runtime/nvn/vulkan/exec/*.h) $(wildcard runtime/nvn/vulkan/shaders/*.h) \
+            $(wildcard runtime/ui/*.h) $(wildcard runtime/services/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
 IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
@@ -94,7 +94,8 @@ IMGUI_OBJ += $(B)/imgui/imgui_impl_metal.o
 else
 DEPINC   += -I$(VULKAN)/include
 LDFLAGS  += -L$(VULKAN)/lib -lvulkan -lshaderc_shared -Wl,-rpath,$(VULKAN)/lib
-BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
+BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp) \
+               $(wildcard runtime/nvn/vulkan/shaders/*.c)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 endif
@@ -125,7 +126,8 @@ SHADERC  ?= $(if $(DEPS),-lshaderc_shared,$(or $(shell pkg-config --libs shaderc
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
 LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan $(SHADERC) -lz -lpthread -ldl -lm
-BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
+BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp) \
+               $(wildcard runtime/nvn/vulkan/shaders/*.c)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
@@ -144,7 +146,8 @@ GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,268435456 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lgdi32 -ladvapi32 -lshaderc_shared -lpdh -lws2_32 -lwinhttp -l:libz.a -lpthread \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> savagewind.log)
-BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
+BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp) \
+               $(wildcard runtime/nvn/vulkan/shaders/*.c)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 BACKEND_OBJ += $(B)/rt/platform/windows_rc.o  # the .exe's icon (Explorer, taskbar)
 WINDRES  ?= windres
@@ -187,7 +190,7 @@ endif
 # them itself). Baked into the generated header $(B)/inc/shader_ids.h, rewritten only when a hash changes, which
 # translate.o and spirv.o include ahead of their source (-include) and depend on.
 TRANSLATOR_SRCS := runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
-SPIRV_SRCS := runtime/nvn/vulkan/spirv.c
+SPIRV_SRCS := runtime/nvn/vulkan/spirv.c $(wildcard runtime/nvn/vulkan/shaders/spirv_*.c)
 TRANSLATOR_ID := $(shell cat $(TRANSLATOR_SRCS) | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 SPIRV_ID := $(shell cat $(SPIRV_SRCS) | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 SHADER_IDS := $(B)/inc/shader_ids.h
@@ -865,6 +868,25 @@ bench-textures: $(B)/test_textures_format
 
 .PHONY: test-textures bench-textures
 endif
+
+# The SPIR-V cache key (unchanged bytes vs. the pre-split hash), the disk round-trip (misses, bad and malformed files)
+# and the ensure/compile handoff (one hash per call), with a fake compiler: no Vulkan device, shaderc or game data.
+# bench-spirv times the key over shader sizes from the precompiled set (~0.4 GB for the whole game).
+SPIRV_TEST_SRCS := runtime/nvn/vulkan/shaders/spirv_core.c runtime/nvn/vulkan/shaders/spirv_hash.c \
+                   runtime/nvn/vulkan/shaders/spirv_cache.c runtime/nvn/vulkan/shaders/cache_path.c
+
+$(B)/test_spirv_cache: tests/test_spirv_cache.c $(SPIRV_TEST_SRCS) $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -g -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ \
+	    tests/test_spirv_cache.c $(SPIRV_TEST_SRCS) -lz
+
+test-spirv: $(B)/test_spirv_cache
+	$(B)/test_spirv_cache
+
+bench-spirv: $(B)/test_spirv_cache
+	$(B)/test_spirv_cache --bench
+
+.PHONY: test-spirv bench-spirv
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
 $(B)/two_button_bindings.o: runtime/hle/bindings.c runtime/input_bind.h

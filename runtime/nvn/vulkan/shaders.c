@@ -33,22 +33,6 @@ const char *vk_shader_version_full(void) {
     return v;
 }
 
-// The shader and pipeline caches live in cache/ under the data root (the working directory), or in the folder
-// SAVAGEWIND_CACHE_DIR names (tests that must not touch the player's caches).
-const char *vk_cache_dir(void) {
-    static const char *dir;
-    if (!dir) {
-        const char *e = getenv("SAVAGEWIND_CACHE_DIR");
-        dir = e && *e ? e : "cache";
-        mkdir(dir, 0755);
-    }
-    return dir;
-}
-
-void vk_cache_path(char *out, size_t n, const char *name) {
-    snprintf(out, n, "%s/%s", vk_cache_dir(), name);
-}
-
 // ---- translated shaders (Maxwell -> GLSL): 1-4 ms each in the open world, on the GPU thread while compiles are
 // synchronous, and programs share their vertex and fragment shaders. Kept in memory by stage, binary and key, and on
 // disk as cache/xlate/<hash>.bin, so a shader seen in an earlier session costs a file read. The hash covers the bytes
@@ -207,18 +191,6 @@ static void xlate_store(uint64_t h, const XlateHeader *hd, const ShaderInfo *si)
     // (another thread may have stored it first; a file of another variant is replaced)
     if (f && ok && !vk_replace_file(tmp, path)) ok = false;
     if (f && !ok) remove(tmp);
-}
-
-// A cache folder's name for an id (TRANSLATOR_ID / SPIRV_ID are 16 hex digits; built without the Makefile, a date)
-const char *vk_cache_dir_id(const char *id) {
-    static __thread char out[2][20];
-    static __thread int k;
-    char *o = out[k++ & 1];
-    bool hex = strlen(id) == 16;
-    for (const char *p = id; *p && hex; p++) hex = (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f');
-    if (hex) snprintf(o, 20, "%s", id);
-    else snprintf(o, 20, "%016llx", (unsigned long long)hash64(0xcbf29ce484222325ull, id, strlen(id)));
-    return o;
 }
 
 // The translations and SPIR-V of other builds (other ids) and of the versions before the folders by id: removed, so
